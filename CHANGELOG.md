@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.2.0
+
+- Add a Home Assistant firmware update entity linked to the existing HomeKit device.
+- Check Qingping's release channel without changing device state.
+- Install offered CGDN1 releases through the App-compatible MQTT OTA flow.
+- Report OTA progress and confirm the installed version through HomeKit.
+- Remove the superseded standalone firmware diagnostic sensor from the entity registry.
+
 ## 1.1.0
 
 - Remove the vendor App signing key from distributable source code.

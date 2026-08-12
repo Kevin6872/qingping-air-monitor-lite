@@ -33,7 +33,6 @@
   "entity": {
     "sensor": {
       "status": {"name": "Status"},
-      "firmware": {"name": "Firmware"},
       "mac_address": {"name": "MAC address"},
       "battery_state": {"name": "Battery state"},
       "cloud_status": {"name": "Cloud status"}
@@ -60,6 +59,9 @@
     "time": {
       "night_mode_start_time": {"name": "Night mode start"},
       "night_mode_end_time": {"name": "Night mode end"}
+    },
+    "update": {
+      "firmware": {"name": "Firmware"}
     }
   }
 }

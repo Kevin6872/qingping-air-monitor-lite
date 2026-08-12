@@ -85,7 +85,6 @@ async def async_setup_entry(
     async_add_entities(
         [
             QingpingStatusSensor(coordinator, config_entry),
-            QingpingFirmwareSensor(coordinator, config_entry),
             QingpingMacSensor(coordinator, config_entry),
             QingpingBatteryStateSensor(coordinator, config_entry),
             QingpingCloudStatusSensor(coordinator, config_entry),
@@ -108,23 +107,6 @@ class QingpingStatusSensor(QingpingLiteEntity, SensorEntity):
     def native_value(self) -> str:
         source: QingpingHomeKitSource | None = self._runtime().get("homekit_source")
         return "online" if source and source.available else "offline"
-
-
-class QingpingFirmwareSensor(QingpingLiteEntity, SensorEntity):
-    """Firmware reported by HomeKit."""
-
-    _attr_translation_key = "firmware"
-    _attr_entity_category = EntityCategory.DIAGNOSTIC
-    _attr_icon = "mdi:chip"
-
-    def __init__(self, coordinator, config_entry) -> None:
-        super().__init__(coordinator, config_entry)
-        self._attr_unique_id = f"{self._mac}_firmware"
-
-    @property
-    def native_value(self) -> str | None:
-        source: QingpingHomeKitSource | None = self._runtime().get("homekit_source")
-        return source.firmware if source else None
 
 
 class QingpingMacSensor(QingpingLiteEntity, SensorEntity):

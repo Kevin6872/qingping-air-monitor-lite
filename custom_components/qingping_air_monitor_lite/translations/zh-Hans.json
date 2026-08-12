@@ -33,7 +33,6 @@
   "entity": {
     "sensor": {
       "status": {"name": "状态"},
-      "firmware": {"name": "固件"},
       "mac_address": {"name": "MAC 地址"},
       "battery_state": {"name": "充电状态"},
       "cloud_status": {"name": "云端连接"}
@@ -58,6 +57,9 @@
     "time": {
       "night_mode_start_time": {"name": "夜间模式开始"},
       "night_mode_end_time": {"name": "夜间模式结束"}
+    },
+    "update": {
+      "firmware": {"name": "固件更新"}
     }
   }
 }
