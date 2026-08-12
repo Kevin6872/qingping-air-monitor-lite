@@ -1,0 +1,12 @@
+{
+  "domain": "qingping_air_monitor_lite",
+  "name": "Qingping Air Monitor Lite",
+  "codeowners": ["@Kevin6872"],
+  "config_flow": true,
+  "dependencies": ["homekit_controller"],
+  "documentation": "https://github.com/Kevin6872/qingping-air-monitor-lite",
+  "issue_tracker": "https://github.com/Kevin6872/qingping-air-monitor-lite/issues",
+  "iot_class": "cloud_push",
+  "requirements": [],
+  "version": "1.1.0"
+}

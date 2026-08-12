@@ -1,0 +1,65 @@
+{
+  "title": "Qingping Air Monitor Lite",
+  "config": {
+    "step": {
+      "user": {
+        "title": "Add Qingping Air Monitor Lite",
+        "description": "The device must already be paired with Home Assistant through HomeKit Device.",
+        "data": {
+          "name": "Name",
+          "mac": "MAC address",
+          "homekit_pairing_id": "HomeKit pairing ID (optional)",
+          "qingping_app_secret": "Qingping App signing key"
+        },
+        "data_description": {
+          "qingping_app_secret": "Private signing key obtained from your own Qingping App installation; it is not included with this integration."
+        }
+      },
+      "reconfigure": {
+        "title": "Update Qingping App signing key",
+        "data": {
+          "qingping_app_secret": "Qingping App signing key"
+        }
+      }
+    },
+    "error": {
+      "invalid_mac": "Enter a valid 12-digit hexadecimal MAC address.",
+      "invalid_app_secret": "Enter a non-empty Qingping App signing key."
+    },
+    "abort": {
+      "reconfigure_successful": "The Qingping App signing key was updated."
+    }
+  },
+  "entity": {
+    "sensor": {
+      "status": {"name": "Status"},
+      "firmware": {"name": "Firmware"},
+      "mac_address": {"name": "MAC address"},
+      "battery_state": {"name": "Battery state"},
+      "cloud_status": {"name": "Cloud status"}
+    },
+    "number": {
+      "temperature_offset": {"name": "Temperature offset"},
+      "humidity_offset": {"name": "Humidity offset"},
+      "co2_offset": {"name": "CO₂ offset"},
+      "pm25_offset": {"name": "PM2.5 offset"},
+      "pm10_offset": {"name": "PM10 offset"},
+      "power_off_time": {"name": "Power-off time"},
+      "display_off_time": {"name": "Display-off time"},
+      "auto_slideing_time": {"name": "Screen saver start delay"},
+      "timezone": {"name": "Time zone"}
+    },
+    "select": {
+      "screensaver_type": {"name": "Screen mode"},
+      "temperature_unit": {"name": "Display temperature unit"},
+      "clock_format": {"name": "Clock format"}
+    },
+    "switch": {
+      "co2_asc": {"name": "CO₂ automatic calibration"}
+    },
+    "time": {
+      "night_mode_start_time": {"name": "Night mode start"},
+      "night_mode_end_time": {"name": "Night mode end"}
+    }
+  }
+}

@@ -1,0 +1,63 @@
+{
+  "title": "青萍空气检测仪 Lite",
+  "config": {
+    "step": {
+      "user": {
+        "title": "添加青萍空气检测仪 Lite",
+        "description": "设备必须已通过 HomeKit 设备集成与 Home Assistant 配对。",
+        "data": {
+          "name": "名称",
+          "mac": "MAC 地址",
+          "homekit_pairing_id": "HomeKit 配对 ID（可选）",
+          "qingping_app_secret": "青萍 App 签名密钥"
+        },
+        "data_description": {
+          "qingping_app_secret": "请填写从你自己的青萍 App 安装中合法取得的签名密钥；本集成不附带该密钥。"
+        }
+      },
+      "reconfigure": {
+        "title": "更新青萍 App 签名密钥",
+        "data": {
+          "qingping_app_secret": "青萍 App 签名密钥"
+        }
+      }
+    },
+    "error": {
+      "invalid_mac": "请输入有效的 12 位十六进制 MAC 地址。",
+      "invalid_app_secret": "请输入非空的青萍 App 签名密钥。"
+    },
+    "abort": {
+      "reconfigure_successful": "青萍 App 签名密钥已更新。"
+    }
+  },
+  "entity": {
+    "sensor": {
+      "status": {"name": "状态"},
+      "firmware": {"name": "固件"},
+      "mac_address": {"name": "MAC 地址"},
+      "battery_state": {"name": "充电状态"},
+      "cloud_status": {"name": "云端连接"}
+    },
+    "number": {
+      "temperature_offset": {"name": "温度偏移"},
+      "humidity_offset": {"name": "湿度偏移"},
+      "co2_offset": {"name": "CO₂ 偏移"},
+      "pm25_offset": {"name": "PM2.5 偏移"},
+      "pm10_offset": {"name": "PM10 偏移"},
+      "power_off_time": {"name": "自动关机时间"},
+      "display_off_time": {"name": "熄屏时间"},
+      "auto_slideing_time": {"name": "屏保启动延迟"},
+      "timezone": {"name": "时区"}
+    },
+    "select": {
+      "screensaver_type": {"name": "屏幕模式"},
+      "temperature_unit": {"name": "显示温度单位"},
+      "clock_format": {"name": "时钟格式"}
+    },
+    "switch": {"co2_asc": {"name": "CO₂ 自动校准"}},
+    "time": {
+      "night_mode_start_time": {"name": "夜间模式开始"},
+      "night_mode_end_time": {"name": "夜间模式结束"}
+    }
+  }
+}
