@@ -7,6 +7,7 @@ from typing import Any
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from .cloud_source import QingpingCloudSource
@@ -21,11 +22,18 @@ PLATFORMS: list[Platform] = [
     Platform.SELECT,
     Platform.SWITCH,
     Platform.TIME,
+    Platform.UPDATE,
 ]
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up one Qingping Air Monitor Lite."""
+    entity_registry = er.async_get(hass)
+    legacy_unique_id = f"{entry.data.get('mac', '')}_firmware"
+    for entity in er.async_entries_for_config_entry(entity_registry, entry.entry_id):
+        if entity.platform == DOMAIN and entity.unique_id == legacy_unique_id:
+            entity_registry.async_remove(entity.entity_id)
+
     hass.data.setdefault(DOMAIN, {})
     coordinator: DataUpdateCoordinator[dict[str, Any]] = DataUpdateCoordinator(
         hass,

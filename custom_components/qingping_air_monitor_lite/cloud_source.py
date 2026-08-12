@@ -43,10 +43,16 @@ CLOUD_CONNECTED = "qingping_cloud_connected"
 CLOUD_LAST_MESSAGE = "qingping_cloud_last_message"
 CLOUD_SETTINGS = "qingping_cloud_settings"
 CLOUD_ERROR = "qingping_cloud_error"
+CLOUD_FIRMWARE_INFO = "qingping_cloud_firmware_info"
+CLOUD_UPDATE_ERROR = "qingping_cloud_update_error"
+CLOUD_UPDATE_IN_PROGRESS = "qingping_cloud_update_in_progress"
+CLOUD_UPDATE_PERCENTAGE = "qingping_cloud_update_percentage"
 
 _DEVICE_RESPONSE_TIMEOUT = 15
 _DEVICE_AVAILABLE_TIMEOUT = 180
 _QUERY_INTERVAL = 90
+_OTA_TIMEOUT = 15 * 60
+_VERSION_CONFIRMATION_TIMEOUT = 5 * 60
 
 
 def _encode_utf8(value: str) -> bytes:
@@ -146,6 +152,18 @@ class _ResponseWaiter:
     response_type: str
     future: asyncio.Future
     matcher: Callable[[Mapping[str, Any]], bool] | None = None
+    on_message: Callable[[Mapping[str, Any]], bool] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class FirmwareUpdateInfo:
+    """Validated firmware metadata returned by Qingping's update service."""
+
+    version: str
+    description: str
+    url: str
+    file_md5: str
+    ota_type: int
 
 
 class QingpingCloudSource:
@@ -180,6 +198,10 @@ class QingpingCloudSource:
         self._last_message: str | None = None
         self._last_error: str | None = None
         self._settings: dict[str, Any] = {}
+        self._firmware_info: FirmwareUpdateInfo | None = None
+        self._update_in_progress = False
+        self._update_percentage: int | None = None
+        self._update_error: str | None = None
         self._response_waiters: dict[str, _ResponseWaiter] = {}
         self._write_lock = asyncio.Lock()
 
@@ -225,6 +247,26 @@ class QingpingCloudSource:
     def settings(self) -> Mapping[str, Any]:
         return self._settings
 
+    @property
+    def firmware_info(self) -> FirmwareUpdateInfo | None:
+        """Return the latest validated firmware offer."""
+        return self._firmware_info
+
+    @property
+    def update_in_progress(self) -> bool:
+        """Return whether the device is installing firmware."""
+        return self._update_in_progress
+
+    @property
+    def update_percentage(self) -> int | None:
+        """Return the last OTA progress percentage."""
+        return self._update_percentage
+
+    @property
+    def update_error(self) -> str | None:
+        """Return the last firmware update error."""
+        return self._update_error
+
     async def async_start(self) -> None:
         """Prepare the App session, then maintain the cloud MQTT connection."""
         if self.config_entry.data.get(CONF_MODEL) != "CGDN1":
@@ -237,6 +279,15 @@ class QingpingCloudSource:
         except (ClientError, TimeoutError, HomeAssistantError, ValueError) as err:
             self._set_error(f"Cloud session setup failed: {err}")
             _LOGGER.warning("Qingping cloud setup failed for %s: %s", self.mac, err)
+        else:
+            try:
+                await self.async_check_firmware_update()
+            except (ClientError, TimeoutError, HomeAssistantError, ValueError) as err:
+                self._update_error = str(err)
+                self._publish_state()
+                _LOGGER.debug(
+                    "Qingping firmware check failed for %s: %s", self.mac, err
+                )
 
         self._task = self.config_entry.async_create_background_task(
             self.hass,
@@ -300,6 +351,130 @@ class QingpingCloudSource:
             self._verify_settings(requested, readback, "readback")
             return readback
 
+    async def async_check_firmware_update(self) -> FirmwareUpdateInfo | None:
+        """Check Qingping's release channel without starting an OTA."""
+        installed_version = self.homekit_source.firmware
+        if not installed_version:
+            raise HomeAssistantError("HomeKit did not report a firmware version")
+        if not self._access_token:
+            raise HomeAssistantError("Qingping cloud session is not ready")
+
+        response = await self._async_api_request(
+            "GET",
+            "/firmware/checkUpdate",
+            params={
+                "version": installed_version,
+                "mac": self.mac,
+                "version_type": "release",
+                "model": "Dany",
+                "homekit": "true",
+            },
+            token=self._access_token,
+        )
+        if response is None or int(response.get("upgrade_sign", 0)) != 1:
+            self._firmware_info = None
+            self._update_error = None
+            self._publish_state()
+            return None
+
+        info = _firmware_info_from_response(response)
+        self._firmware_info = info
+        self._update_error = None
+        self._publish_state()
+        return info
+
+    async def async_install_firmware(self, version: str | None = None) -> None:
+        """Install the offered release and verify it through HomeKit."""
+        info = self._firmware_info
+        if info is None:
+            info = await self.async_check_firmware_update()
+        if info is None:
+            raise HomeAssistantError("No Qingping firmware update is available")
+        if version is not None and version != info.version:
+            raise HomeAssistantError(
+                f"Firmware {version} is not the offered release {info.version}"
+            )
+        if not self.available or self._ws is None:
+            raise HomeAssistantError(
+                "Qingping Air Monitor Lite is not responding on the cloud channel"
+            )
+
+        async with self._write_lock:
+            self._update_in_progress = True
+            self._update_percentage = 0
+            self._update_error = None
+            self._publish_state()
+            cid = secrets.token_hex(8)[:10]
+            future = asyncio.get_running_loop().create_future()
+            self._response_waiters[cid] = _ResponseWaiter(
+                response_type="24",
+                future=future,
+                on_message=self._handle_firmware_progress,
+            )
+            try:
+                await self._async_publish_data(
+                    {
+                        "type": "23",
+                        "url": info.url,
+                        "file_md5": info.file_md5,
+                        "desc": info.description,
+                        "version": info.version,
+                        "ota_type": info.ota_type,
+                    },
+                    cid=cid,
+                )
+                async with asyncio.timeout(_OTA_TIMEOUT):
+                    await future
+                await self._async_confirm_firmware_version(info.version)
+            except TimeoutError as err:
+                error = "Timed out waiting for Qingping firmware installation"
+                self._update_error = error
+                raise HomeAssistantError(error) from err
+            except Exception as err:
+                self._update_error = str(err)
+                raise
+            else:
+                self._firmware_info = None
+                self._update_error = None
+            finally:
+                self._response_waiters.pop(cid, None)
+                self._update_in_progress = False
+                self._update_percentage = None
+                self._publish_state()
+
+    def _handle_firmware_progress(self, data: Mapping[str, Any]) -> bool:
+        """Record a type-24 OTA report and return whether transfer completed."""
+        try:
+            error_code = int(data.get("error_code", 0))
+        except (TypeError, ValueError) as err:
+            raise HomeAssistantError(
+                "Qingping returned an invalid OTA error code"
+            ) from err
+        if error_code != 0:
+            raise HomeAssistantError(
+                f"Qingping firmware installation failed ({error_code})"
+            )
+
+        try:
+            percentage = int(data.get("percent", 0))
+        except (TypeError, ValueError) as err:
+            raise HomeAssistantError("Qingping returned invalid OTA progress") from err
+        self._update_percentage = min(100, max(0, percentage))
+        self._publish_state()
+        return self._update_percentage >= 100
+
+    async def _async_confirm_firmware_version(self, expected: str) -> None:
+        """Wait for HomeKit to report the installed firmware version."""
+        deadline = time.monotonic() + _VERSION_CONFIRMATION_TIMEOUT
+        while time.monotonic() < deadline:
+            await self.homekit_source.async_refresh()
+            if self.homekit_source.firmware == expected:
+                return
+            await asyncio.sleep(10)
+        raise HomeAssistantError(
+            f"Firmware transfer completed but HomeKit did not report {expected}"
+        )
+
     async def _async_prepare_session(self) -> None:
         """Validate or create the App token and obtain fresh MQTT credentials."""
         if self._access_token:
@@ -350,6 +525,7 @@ class QingpingCloudSource:
         path: str,
         *,
         data: Mapping[str, Any] | None = None,
+        params: Mapping[str, Any] | None = None,
         token: str | None = None,
         allow_auth_error: bool = False,
     ) -> dict[str, Any] | None:
@@ -389,6 +565,7 @@ class QingpingCloudSource:
                 method,
                 f"{API_HOST}{path}",
                 headers=headers,
+                params=dict(params) if params is not None else None,
                 json=dict(data) if data is not None else None,
             ) as response:
                 response.raise_for_status()
@@ -537,8 +714,7 @@ class QingpingCloudSource:
             # An echoed cid is authoritative. Return even a negative or
             # mismatching acknowledgement to the caller so verification can
             # report the actual device response instead of timing out.
-            if waiter.response_type == message_type and not waiter.future.done():
-                waiter.future.set_result(data)
+            self._deliver_waiter(waiter, message_type, data)
         else:
             # Some firmware replies omit or replace the outer cid. Fall back
             # only when one request-specific matcher unambiguously accepts the
@@ -550,8 +726,8 @@ class QingpingCloudSource:
                 if not pending.future.done()
                 and self._waiter_matches(pending, message_type, data)
             ]
-            if len(matches) == 1 and not matches[0].future.done():
-                matches[0].future.set_result(data)
+            if len(matches) == 1:
+                self._deliver_waiter(matches[0], message_type, data)
         self._publish_state()
 
     async def _async_send_and_wait(
@@ -623,6 +799,25 @@ class QingpingCloudSource:
         return waiter.matcher is None or waiter.matcher(data)
 
     @staticmethod
+    def _deliver_waiter(
+        waiter: _ResponseWaiter,
+        message_type: str,
+        data: Mapping[str, Any],
+    ) -> None:
+        """Deliver one matching message, optionally retaining a stream waiter."""
+        if waiter.future.done() or not QingpingCloudSource._waiter_matches(
+            waiter, message_type, data
+        ):
+            return
+        try:
+            completed = waiter.on_message is None or waiter.on_message(data)
+        except Exception as err:
+            waiter.future.set_exception(err)
+            return
+        if completed:
+            waiter.future.set_result(data)
+
+    @staticmethod
     def _verify_settings(
         expected: Mapping[str, Any], actual: Mapping[str, Any], stage: str
     ) -> None:
@@ -662,6 +857,10 @@ class QingpingCloudSource:
         self.runtime[CLOUD_LAST_MESSAGE] = self.last_message
         self.runtime[CLOUD_SETTINGS] = dict(self._settings)
         self.runtime[CLOUD_ERROR] = self.last_error
+        self.runtime[CLOUD_FIRMWARE_INFO] = self._firmware_info
+        self.runtime[CLOUD_UPDATE_IN_PROGRESS] = self._update_in_progress
+        self.runtime[CLOUD_UPDATE_PERCENTAGE] = self._update_percentage
+        self.runtime[CLOUD_UPDATE_ERROR] = self._update_error
         self.coordinator.async_set_updated_data(self.runtime)
 
     @callback
@@ -676,6 +875,37 @@ def _qingping_timezone_value() -> int:
     """Return the App protocol timezone value (UTC offset hours multiplied by 10)."""
     offset = dt_util.now().utcoffset() or timedelta()
     return int(offset.total_seconds() / 360)
+
+
+def _firmware_info_from_response(
+    response: Mapping[str, Any],
+) -> FirmwareUpdateInfo:
+    """Validate firmware metadata before it can reach the physical device."""
+    version = str(response.get("version", "")).strip()
+    description = str(response.get("desc", "")).strip()
+    url = str(response.get("app_url", "")).strip()
+    file_md5 = str(response.get("file_md5", "")).strip().lower()
+    if not version:
+        raise HomeAssistantError("Qingping firmware response has no version")
+    if not url.startswith(("https://", "http://")):
+        raise HomeAssistantError("Qingping firmware response has an invalid URL")
+    if len(file_md5) != 32 or any(
+        char not in "0123456789abcdef" for char in file_md5
+    ):
+        raise HomeAssistantError("Qingping firmware response has an invalid MD5")
+    try:
+        ota_type = int(response.get("ota_type") or response.get("type") or 0)
+    except (TypeError, ValueError) as err:
+        raise HomeAssistantError(
+            "Qingping firmware response has invalid OTA type"
+        ) from err
+    return FirmwareUpdateInfo(
+        version=version,
+        description=description,
+        url=url,
+        file_md5=file_md5,
+        ota_type=ota_type,
+    )
 
 
 def cloud_source_for_runtime(
