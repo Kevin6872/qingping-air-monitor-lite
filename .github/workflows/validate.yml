@@ -26,3 +26,5 @@ jobs:
           python-version: "3.13"
       - name: Compile integration
         run: python -m compileall -q custom_components/qingping_air_monitor_lite
+      - name: Test cloud session recovery and write confirmation
+        run: python -m unittest discover -s tests -v

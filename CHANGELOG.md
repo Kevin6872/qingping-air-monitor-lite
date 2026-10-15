@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.2.1
+
+- Keep MQTT heartbeats and periodic settings queries running during continuous incoming traffic.
+- Reconnect and refresh credentials after failed broker heartbeats or a silent device.
+- Retry read-only settings queries before writes without falling back to stale settings.
+- Verify a missing write acknowledgement by readback instead of sending duplicate writes.
+- Allow delayed write acknowledgements and temporarily stale readback reports to settle.
+- Report whether a failure happened before or after settings were sent.
+- Clean up reply futures during send failures and unload, and surface negative correlated acknowledgements.
+- Add isolated client regression tests for timers, retries, write confirmation, and cleanup.
+
 ## 1.2.0
 
 - Add a Home Assistant firmware update entity linked to the existing HomeKit device.

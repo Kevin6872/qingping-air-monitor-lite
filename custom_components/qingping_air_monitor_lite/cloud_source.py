@@ -51,8 +51,36 @@ CLOUD_UPDATE_PERCENTAGE = "qingping_cloud_update_percentage"
 _DEVICE_RESPONSE_TIMEOUT = 15
 _DEVICE_AVAILABLE_TIMEOUT = 180
 _QUERY_INTERVAL = 90
+_MQTT_TICK_INTERVAL = 5
+_MQTT_CONNECT_TIMEOUT = 20
+_MQTT_PING_INTERVAL = 30
+_MQTT_PING_TIMEOUT = 15
+_SETTINGS_QUERY_ATTEMPTS = 2
+_SETTINGS_QUERY_RETRY_DELAY = 1
+_RECONNECT_WAIT_TIMEOUT = 15
+_WRITE_ACK_TIMEOUT = 45
+_WRITE_READBACK_TIMEOUT = 45
+_SETTINGS_READBACK_RETRY_DELAY = 3
 _OTA_TIMEOUT = 15 * 60
 _VERSION_CONFIRMATION_TIMEOUT = 5 * 60
+
+
+class _DeviceResponseTimeout(HomeAssistantError):
+    """The broker accepted a request but the device did not answer it."""
+
+
+class _CloudConnectionError(HomeAssistantError):
+    """The cloud session must reconnect before another request can run."""
+
+
+@dataclass
+class _MQTTSessionTimers:
+    """Deadlines that advance independently of incoming MQTT messages."""
+
+    started_at: float
+    next_ping: float
+    next_query: float
+    ping_deadline: float | None = None
 
 
 def _encode_utf8(value: str) -> bytes:
@@ -194,6 +222,7 @@ class QingpingCloudSource:
         self._task: asyncio.Task | None = None
         self._stop = asyncio.Event()
         self._connected = False
+        self._connected_event = asyncio.Event()
         self._last_message_monotonic: float | None = None
         self._last_message: str | None = None
         self._last_error: str | None = None
@@ -204,6 +233,7 @@ class QingpingCloudSource:
         self._update_error: str | None = None
         self._response_waiters: dict[str, _ResponseWaiter] = {}
         self._write_lock = asyncio.Lock()
+        self._request_lock = asyncio.Lock()
 
     @property
     def connected(self) -> bool:
@@ -277,7 +307,9 @@ class QingpingCloudSource:
         try:
             await self._async_prepare_session()
         except (ClientError, TimeoutError, HomeAssistantError, ValueError) as err:
-            self._set_error(f"Cloud session setup failed: {err}")
+            self._set_error(
+                f"Cloud session setup failed: {str(err) or type(err).__name__}"
+            )
             _LOGGER.warning("Qingping cloud setup failed for %s: %s", self.mac, err)
         else:
             try:
@@ -298,6 +330,7 @@ class QingpingCloudSource:
     async def async_stop(self) -> None:
         """Stop the cloud connection and fail any waiting service call."""
         self._stop.set()
+        self._connected_event.set()
         if self._ws is not None:
             await self._ws.close()
         if self._task is not None:
@@ -306,19 +339,72 @@ class QingpingCloudSource:
                 await self._task
             self._task = None
         self._set_connected(False)
-        self._fail_waiters(HomeAssistantError("Qingping cloud connection stopped"))
+        self._fail_waiters(_CloudConnectionError("Qingping cloud connection stopped"))
 
     async def async_query_settings(self) -> dict[str, Any]:
-        """Request type 28 settings and wait for this physical device's reply."""
-        response = await self._async_send_and_wait(
-            {"type": "28"},
-            "28",
-            matcher=lambda data: isinstance(data.get("setting"), dict),
-        )
-        settings = response.get("setting")
-        if not isinstance(settings, dict):
-            raise HomeAssistantError("Qingping device returned no settings")
-        return dict(settings)
+        """Read fresh settings with bounded retries, never from the cache."""
+        for attempt in range(1, _SETTINGS_QUERY_ATTEMPTS + 1):
+            try:
+                await self._async_wait_connected()
+                response = await self._async_send_and_wait(
+                    {"type": "28"},
+                    "28",
+                    matcher=lambda data: isinstance(data.get("setting"), dict),
+                )
+            except (
+                _DeviceResponseTimeout,
+                _CloudConnectionError,
+                ClientError,
+                OSError,
+                TimeoutError,
+            ) as err:
+                if self._stop.is_set():
+                    raise _CloudConnectionError("Qingping cloud connection stopped") from err
+                _LOGGER.debug(
+                    "Qingping settings query %s/%s failed for %s: %s",
+                    attempt,
+                    _SETTINGS_QUERY_ATTEMPTS,
+                    self.mac,
+                    str(err) or type(err).__name__,
+                )
+                if attempt == _SETTINGS_QUERY_ATTEMPTS:
+                    reason = (
+                        "Qingping settings query failed after "
+                        f"{attempt} attempts; refreshing the cloud session"
+                    )
+                    await self._async_reconnect(reason)
+                    raise HomeAssistantError(reason) from err
+                await asyncio.sleep(_SETTINGS_QUERY_RETRY_DELAY)
+                continue
+
+            settings = response.get("setting")
+            if not isinstance(settings, dict):
+                raise HomeAssistantError("Qingping device returned no settings")
+            return dict(settings)
+
+        raise RuntimeError("Settings query exhausted without a result")
+
+    async def _async_wait_connected(self) -> None:
+        """Allow a request to survive a brief automatic reconnect."""
+        if self._stop.is_set():
+            raise _CloudConnectionError("Qingping cloud connection stopped")
+        try:
+            async with asyncio.timeout(_RECONNECT_WAIT_TIMEOUT):
+                await self._connected_event.wait()
+        except TimeoutError as err:
+            raise _CloudConnectionError(
+                "Timed out waiting for the Qingping cloud connection"
+            ) from err
+        if self._stop.is_set() or not self._connected:
+            raise _CloudConnectionError("Qingping cloud connection was interrupted")
+
+    async def _async_reconnect(self, reason: str) -> None:
+        """Invalidate a silent session and let the owner refresh credentials."""
+        self._set_error(reason)
+        self._set_connected(False)
+        self._fail_waiters(_CloudConnectionError(reason))
+        if self._ws is not None:
+            await self._ws.close()
 
     async def async_set_settings(self, changes: Mapping[str, Any]) -> dict[str, Any]:
         """Send App-compatible type 17 settings, then query and verify readback."""
@@ -330,26 +416,69 @@ class QingpingCloudSource:
             # Type 17 requires the complete settings object. Always fetch a
             # fresh snapshot immediately before merging so a recent App change
             # is not overwritten by HA's older cache.
-            current = await self.async_query_settings()
+            try:
+                current = await self.async_query_settings()
+            except HomeAssistantError as err:
+                raise HomeAssistantError(
+                    "Could not read fresh Qingping settings before writing; "
+                    f"the requested changes were not sent: {err}"
+                ) from err
             merged = {**current, **requested}
             merged.setdefault("is_12_hour_mode", current.get("is_12_hour_mode", 0))
             merged.setdefault("pm25_standard", current.get("pm25_standard", 0))
 
-            response = await self._async_send_and_wait(
-                {"type": "17", "setting": merged},
-                "28",
-                matcher=lambda data: self._settings_include(data, requested),
-            )
-            acknowledged = response.get("setting")
-            if not isinstance(acknowledged, dict):
-                raise HomeAssistantError(
-                    "Qingping device did not return its settings acknowledgement"
+            try:
+                response = await self._async_send_and_wait(
+                    {"type": "17", "setting": merged},
+                    "28",
+                    matcher=lambda data: self._settings_include(data, requested),
+                    timeout=_WRITE_ACK_TIMEOUT,
                 )
-            self._verify_settings(requested, acknowledged, "acknowledgement")
+            except (_DeviceResponseTimeout, _CloudConnectionError):
+                # The write may already have reached the device. Verify it by
+                # reading, rather than blindly sending the full settings twice.
+                _LOGGER.debug(
+                    "Qingping write acknowledgement missing for %s; checking readback",
+                    self.mac,
+                )
+            else:
+                acknowledged = response.get("setting")
+                if not isinstance(acknowledged, dict):
+                    raise HomeAssistantError(
+                        "Qingping device returned no settings acknowledgement"
+                    )
+                self._verify_settings(requested, acknowledged, "acknowledgement")
 
-            readback = await self.async_query_settings()
+            try:
+                readback = await self._async_readback_settings(requested)
+            except HomeAssistantError as err:
+                raise HomeAssistantError(
+                    "Qingping settings were sent, but readback failed; "
+                    f"the device may already have applied them: {err}"
+                ) from err
             self._verify_settings(requested, readback, "readback")
             return readback
+
+    async def _async_readback_settings(
+        self, expected: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Allow delayed device reports to settle without replaying the write."""
+        last_readback: dict[str, Any] | None = None
+        try:
+            async with asyncio.timeout(_WRITE_READBACK_TIMEOUT):
+                while True:
+                    last_readback = await self.async_query_settings()
+                    if all(last_readback.get(key) == value for key, value in expected.items()):
+                        return last_readback
+                    _LOGGER.debug(
+                        "Qingping readback still has older settings for %s; waiting for device",
+                        self.mac,
+                    )
+                    await asyncio.sleep(_SETTINGS_READBACK_RETRY_DELAY)
+        except TimeoutError as err:
+            if last_readback is not None:
+                self._verify_settings(expected, last_readback, "readback")
+            raise HomeAssistantError("Timed out verifying Qingping settings readback") from err
 
     async def async_check_firmware_update(self) -> FirmwareUpdateInfo | None:
         """Check Qingping's release channel without starting an OTA."""
@@ -498,7 +627,6 @@ class QingpingCloudSource:
         if not isinstance(mqtt, dict) or not mqtt.get("brokerUrl"):
             raise HomeAssistantError("Qingping API returned no MQTT configuration")
         self._mqtt = dict(mqtt)
-        self._set_error(None)
 
     async def _async_report_homekit_device(self) -> None:
         metadata = self.homekit_source.accessory_metadata
@@ -590,6 +718,7 @@ class QingpingCloudSource:
     async def _async_run_forever(self) -> None:
         retry_delay = 5
         while not self._stop.is_set():
+            session_started = time.monotonic()
             try:
                 if not self._mqtt:
                     await self._async_prepare_session()
@@ -598,24 +727,33 @@ class QingpingCloudSource:
             except asyncio.CancelledError:
                 raise
             except (ClientError, TimeoutError, HomeAssistantError, ValueError) as err:
-                self._set_error(str(err))
+                reason = str(err) or type(err).__name__
+                self._set_error(reason)
                 # MQTT URLs and credentials are short-lived. Discard them on
                 # every failed session so the next retry obtains a fresh pair
                 # list instead of retrying expired credentials indefinitely.
                 self._mqtt.clear()
                 _LOGGER.warning(
-                    "Qingping cloud connection failed for %s: %s", self.mac, err
+                    "Qingping cloud connection failed for %s: %s", self.mac, reason
                 )
+                if (
+                    self._last_message_monotonic is not None
+                    and self._last_message_monotonic >= session_started
+                ):
+                    retry_delay = 5
             finally:
                 self._ws = None
                 self._set_connected(False)
                 self._fail_waiters(
-                    HomeAssistantError("Qingping cloud connection was interrupted")
+                    _CloudConnectionError("Qingping cloud connection was interrupted")
                 )
 
             if self._stop.is_set():
                 break
-            await asyncio.sleep(retry_delay)
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=retry_delay)
+            except TimeoutError:
+                pass
             retry_delay = min(retry_delay * 2, 60)
 
     async def _async_mqtt_session(self) -> None:
@@ -636,6 +774,14 @@ class QingpingCloudSource:
             str(required["url"]), protocols=("mqtt",), heartbeat=None
         ) as ws:
             self._ws = ws
+            self._set_connected(False)
+            self._last_message_monotonic = None
+            started_at = time.monotonic()
+            timers = _MQTTSessionTimers(
+                started_at=started_at,
+                next_ping=started_at + _MQTT_PING_INTERVAL,
+                next_query=started_at,
+            )
             await ws.send_bytes(
                 _mqtt_connect_packet(
                     str(required["client_id"]),
@@ -643,21 +789,15 @@ class QingpingCloudSource:
                     str(required["password"]),
                 )
             )
-            last_query = 0.0
-
             while not self._stop.is_set():
+                # Check independent deadlines even if ws.receive() never goes
+                # idle. MQTT traffic must not starve PINGREQ or reconciliation.
+                await self._async_maintain_mqtt_session(ws, timers)
                 try:
-                    message = await asyncio.wait_for(ws.receive(), timeout=30)
+                    message = await asyncio.wait_for(
+                        ws.receive(), timeout=_MQTT_TICK_INTERVAL
+                    )
                 except TimeoutError:
-                    await ws.send_bytes(b"\xC0\x00")
-                    if (
-                        self._connected
-                        and not self._response_waiters
-                        and time.monotonic() - last_query >= _QUERY_INTERVAL
-                    ):
-                        await self._async_publish_data({"type": "28"})
-                        last_query = time.monotonic()
-                    self._publish_state()
                     continue
 
                 if message.type in {WSMsgType.CLOSE, WSMsgType.CLOSED, WSMsgType.ERROR}:
@@ -677,13 +817,57 @@ class QingpingCloudSource:
                         _mqtt_subscribe_packet(str(required["sub_topic"]))
                     )
                 elif packet_type == 9:
+                    if len(packet) < 5 or packet[-1] == 0x80:
+                        raise _CloudConnectionError(
+                            "Qingping MQTT subscription rejected"
+                        )
                     self._set_connected(True)
-                    self._set_error(None)
-                    await self._async_publish_data({"type": "28"})
-                    last_query = time.monotonic()
+                    timers.next_query = time.monotonic()
+                elif packet_type == 13:
+                    timers.ping_deadline = None
                 elif packet_type == 3:
                     _topic, payload = _decode_publish(packet)
                     await self._async_handle_device_message(payload)
+
+    async def _async_maintain_mqtt_session(
+        self, ws: ClientWebSocketResponse, timers: _MQTTSessionTimers
+    ) -> None:
+        """Keep broker and device health independent of incoming traffic."""
+        now = time.monotonic()
+        if not self._connected and now - timers.started_at >= _MQTT_CONNECT_TIMEOUT:
+            raise _CloudConnectionError("Qingping MQTT handshake timed out")
+        if timers.ping_deadline is not None and now >= timers.ping_deadline:
+            raise _CloudConnectionError("Qingping MQTT heartbeat timed out")
+
+        if now >= timers.next_ping:
+            await ws.send_bytes(b"\xC0\x00")
+            timers.next_ping = now + _MQTT_PING_INTERVAL
+            timers.ping_deadline = now + _MQTT_PING_TIMEOUT
+            _LOGGER.debug("Qingping MQTT heartbeat sent for %s", self.mac)
+
+        last_device_message = max(
+            timers.started_at, self._last_message_monotonic or timers.started_at
+        )
+        if (
+            self._connected
+            and not self._update_in_progress
+            and now - last_device_message >= _DEVICE_AVAILABLE_TIMEOUT
+        ):
+            raise _CloudConnectionError(
+                "Qingping device stopped responding; refreshing the cloud session"
+            )
+
+        if (
+            self._connected
+            and now >= timers.next_query
+            and not self._write_lock.locked()
+            and not self._request_lock.locked()
+            and not self._response_waiters
+            and not self._update_in_progress
+        ):
+            await self._async_publish_data({"type": "28"})
+            timers.next_query = now + _QUERY_INTERVAL
+        self._publish_state()
 
     async def _async_handle_device_message(self, payload: str) -> None:
         outer_mac, response_cid, data = _unwrap_device_message(payload)
@@ -696,6 +880,7 @@ class QingpingCloudSource:
 
         self._last_message_monotonic = time.monotonic()
         self._last_message = dt_util.utcnow().isoformat()
+        self._last_error = None
         settings = data.get("setting")
         if isinstance(settings, dict):
             self._settings = dict(settings)
@@ -714,7 +899,7 @@ class QingpingCloudSource:
             # An echoed cid is authoritative. Return even a negative or
             # mismatching acknowledgement to the caller so verification can
             # report the actual device response instead of timing out.
-            self._deliver_waiter(waiter, message_type, data)
+            self._deliver_waiter(waiter, message_type, data, exact_cid=True)
         else:
             # Some firmware replies omit or replace the outer cid. Fall back
             # only when one request-specific matcher unambiguously accepts the
@@ -736,9 +921,24 @@ class QingpingCloudSource:
         response_type: str,
         *,
         matcher: Callable[[Mapping[str, Any]], bool] | None = None,
+        timeout: float | None = None,
     ) -> dict[str, Any]:
+        async with self._request_lock:
+            return await self._async_request(
+                data, response_type, matcher=matcher, timeout=timeout
+            )
+
+    async def _async_request(
+        self,
+        data: Mapping[str, Any],
+        response_type: str,
+        *,
+        matcher: Callable[[Mapping[str, Any]], bool] | None = None,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        """Own one reply waiter, including cleanup after send failures."""
         if not self._connected or self._ws is None:
-            raise HomeAssistantError("Qingping cloud MQTT is not connected")
+            raise _CloudConnectionError("Qingping cloud MQTT is not connected")
         cid = secrets.token_hex(8)[:10]
         future = asyncio.get_running_loop().create_future()
         self._response_waiters[cid] = _ResponseWaiter(
@@ -748,14 +948,22 @@ class QingpingCloudSource:
         )
         try:
             await self._async_publish_data(data, cid=cid)
-            async with asyncio.timeout(_DEVICE_RESPONSE_TIMEOUT):
+            async with asyncio.timeout(
+                _DEVICE_RESPONSE_TIMEOUT if timeout is None else timeout
+            ):
                 response = await future
         except TimeoutError as err:
-            raise HomeAssistantError(
+            raise _DeviceResponseTimeout(
                 f"Qingping device did not answer type {response_type}"
             ) from err
         finally:
             self._response_waiters.pop(cid, None)
+            if not future.done():
+                future.cancel()
+            elif not future.cancelled():
+                # A concurrent disconnect can fail this future while publish
+                # itself raises. Retrieve it even when no await was reached.
+                future.exception()
         return response
 
     async def _async_publish_data(
@@ -774,6 +982,9 @@ class QingpingCloudSource:
             _mqtt_publish_packet(
                 self.pub_topic, json.dumps(envelope, separators=(",", ":"))
             )
+        )
+        _LOGGER.debug(
+            "Qingping request type %s sent for %s", data.get("type"), self.mac
         )
         return request_cid
 
@@ -803,10 +1014,17 @@ class QingpingCloudSource:
         waiter: _ResponseWaiter,
         message_type: str,
         data: Mapping[str, Any],
+        *,
+        exact_cid: bool = False,
     ) -> None:
         """Deliver one matching message, optionally retaining a stream waiter."""
-        if waiter.future.done() or not QingpingCloudSource._waiter_matches(
-            waiter, message_type, data
+        if (
+            waiter.future.done()
+            or waiter.response_type != message_type
+            or (
+                not exact_cid
+                and not QingpingCloudSource._waiter_matches(waiter, message_type, data)
+            )
         ):
             return
         try:
@@ -840,6 +1058,10 @@ class QingpingCloudSource:
 
     @callback
     def _set_connected(self, connected: bool) -> None:
+        if connected:
+            self._connected_event.set()
+        else:
+            self._connected_event.clear()
         if self._connected == connected:
             return
         self._connected = connected
