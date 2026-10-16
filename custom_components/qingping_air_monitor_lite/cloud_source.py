@@ -59,7 +59,7 @@ _SETTINGS_QUERY_ATTEMPTS = 2
 _SETTINGS_QUERY_RETRY_DELAY = 1
 _RECONNECT_WAIT_TIMEOUT = 15
 _WRITE_ACK_TIMEOUT = 45
-_WRITE_READBACK_TIMEOUT = 45
+_WRITE_READBACK_TIMEOUT = 90
 _SETTINGS_READBACK_RETRY_DELAY = 3
 _OTA_TIMEOUT = 15 * 60
 _VERSION_CONFIRMATION_TIMEOUT = 5 * 60
@@ -373,7 +373,7 @@ class QingpingCloudSource:
                         f"{attempt} attempts; refreshing the cloud session"
                     )
                     await self._async_reconnect(reason)
-                    raise HomeAssistantError(reason) from err
+                    raise _CloudConnectionError(reason) from err
                 await asyncio.sleep(_SETTINGS_QUERY_RETRY_DELAY)
                 continue
 
@@ -423,6 +423,11 @@ class QingpingCloudSource:
                     "Could not read fresh Qingping settings before writing; "
                     f"the requested changes were not sent: {err}"
                 ) from err
+            if all(current.get(key) == value for key, value in requested.items()):
+                # Automations may repeatedly submit the same night schedule.
+                # A fresh device read is already a confirmed no-op; avoid a
+                # redundant full settings write and its delayed acknowledgement.
+                return current
             merged = {**current, **requested}
             merged.setdefault("is_12_hour_mode", current.get("is_12_hour_mode", 0))
             merged.setdefault("pm25_standard", current.get("pm25_standard", 0))
@@ -467,13 +472,25 @@ class QingpingCloudSource:
         try:
             async with asyncio.timeout(_WRITE_READBACK_TIMEOUT):
                 while True:
-                    last_readback = await self.async_query_settings()
-                    if all(last_readback.get(key) == value for key, value in expected.items()):
-                        return last_readback
-                    _LOGGER.debug(
-                        "Qingping readback still has older settings for %s; waiting for device",
-                        self.mac,
-                    )
+                    try:
+                        last_readback = await self.async_query_settings()
+                    except _CloudConnectionError:
+                        if self._stop.is_set():
+                            raise
+                        _LOGGER.debug(
+                            "Qingping readback interrupted for %s; waiting for reconnect",
+                            self.mac,
+                        )
+                    else:
+                        if all(
+                            last_readback.get(key) == value
+                            for key, value in expected.items()
+                        ):
+                            return last_readback
+                        _LOGGER.debug(
+                            "Qingping readback still has older settings for %s; waiting for device",
+                            self.mac,
+                        )
                     await asyncio.sleep(_SETTINGS_READBACK_RETRY_DELAY)
         except TimeoutError as err:
             if last_readback is not None:

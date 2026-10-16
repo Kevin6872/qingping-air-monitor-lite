@@ -199,6 +199,7 @@ class CloudClientTests(unittest.IsolatedAsyncioTestCase):
         self.source._async_send_and_wait.assert_not_called()
 
     async def test_lost_write_ack_is_checked_without_sending_the_write_twice(self):
+        self.source._settings = {"night_mode_end_time": 180}
         self.source.async_query_settings = AsyncMock(side_effect=[
             {"night_mode_end_time": 100, "other_app_setting": 42},
             {"night_mode_end_time": 180, "other_app_setting": 42},
@@ -210,6 +211,92 @@ class CloudClientTests(unittest.IsolatedAsyncioTestCase):
         sent = self.source._async_send_and_wait.call_args.args[0]
         self.assertEqual(sent["type"], "17")
         self.assertEqual(sent["setting"]["other_app_setting"], 42)
+
+    async def test_confirmed_unchanged_settings_do_not_send_a_redundant_write(self):
+        self.source._settings = {"night_mode_end_time": 100}
+        self.source.async_query_settings = AsyncMock(return_value={
+            "night_mode_end_time": 180, "other_app_setting": 42,
+        })
+        self.source._async_send_and_wait = AsyncMock()
+        result = await self.source.async_set_settings({"night_mode_end_time": 180})
+        self.assertEqual(result["night_mode_end_time"], 180)
+        self.source.async_query_settings.assert_awaited_once()
+        self.source._async_send_and_wait.assert_not_awaited()
+
+    async def test_a_partly_changed_request_is_not_treated_as_unchanged(self):
+        self.source.async_query_settings = AsyncMock(side_effect=[
+            {"night_mode_end_time": 180, "night_mode_start_time": 100},
+            {"night_mode_end_time": 180, "night_mode_start_time": 300},
+        ])
+        self.source._async_send_and_wait = AsyncMock(return_value={
+            "type": "28", "setting": {"night_mode_end_time": 180, "night_mode_start_time": 300},
+        })
+        result = await self.source.async_set_settings({
+            "night_mode_end_time": 180, "night_mode_start_time": 300,
+        })
+        self.assertEqual(result["night_mode_start_time"], 300)
+        self.source._async_send_and_wait.assert_awaited_once()
+
+    async def test_readback_survives_a_brief_disconnect_without_replaying_the_write(self):
+        self.source.async_query_settings = AsyncMock(side_effect=[
+            {"night_mode_end_time": 100},
+            cloud._CloudConnectionError("reconnecting"),
+            {"night_mode_end_time": 180},
+        ])
+        self.source._async_send_and_wait = AsyncMock(return_value={
+            "type": "28", "setting": {"night_mode_end_time": 180},
+        })
+        with patch.object(cloud, "_SETTINGS_READBACK_RETRY_DELAY", 0):
+            result = await self.source.async_set_settings({"night_mode_end_time": 180})
+        self.assertEqual(result["night_mode_end_time"], 180)
+        self.source._async_send_and_wait.assert_awaited_once()
+
+    async def test_a_permanent_readback_outage_remains_bounded_and_fails(self):
+        calls = 0
+        async def query():
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return {"night_mode_end_time": 100}
+            raise cloud._CloudConnectionError("still offline")
+        self.source.async_query_settings = query
+        self.source._async_send_and_wait = AsyncMock(return_value={
+            "type": "28", "setting": {"night_mode_end_time": 180},
+        })
+        with patch.object(cloud, "_WRITE_READBACK_TIMEOUT", 0.01), \
+             patch.object(cloud, "_SETTINGS_READBACK_RETRY_DELAY", 0):
+            with self.assertRaisesRegex(cloud.HomeAssistantError, "Timed out verifying"):
+                await self.source.async_set_settings({"night_mode_end_time": 180})
+        self.assertGreater(calls, 2)
+        self.source._async_send_and_wait.assert_awaited_once()
+
+    async def test_invalid_readback_is_not_retried_as_a_connection_error(self):
+        self.source.async_query_settings = AsyncMock(side_effect=[
+            {"night_mode_end_time": 100}, cloud.HomeAssistantError("invalid settings"),
+        ])
+        self.source._async_send_and_wait = AsyncMock(return_value={
+            "type": "28", "setting": {"night_mode_end_time": 180},
+        })
+        with self.assertRaisesRegex(cloud.HomeAssistantError, "invalid settings"):
+            await self.source.async_set_settings({"night_mode_end_time": 180})
+        self.assertEqual(self.source.async_query_settings.await_count, 2)
+
+    async def test_unload_does_not_retry_readback_for_the_remaining_window(self):
+        calls = 0
+        async def query():
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return {"night_mode_end_time": 100}
+            self.source._stop.set()
+            raise cloud._CloudConnectionError("stopped")
+        self.source.async_query_settings = query
+        self.source._async_send_and_wait = AsyncMock(return_value={
+            "type": "28", "setting": {"night_mode_end_time": 180},
+        })
+        with self.assertRaisesRegex(cloud.HomeAssistantError, "stopped"):
+            await asyncio.wait_for(self.source.async_set_settings({"night_mode_end_time": 180}), 0.5)
+        self.assertEqual(calls, 2)
 
     async def test_readback_mismatch_is_not_reported_as_success(self):
         self.source.async_query_settings = AsyncMock(return_value={"night_mode_end_time": 100})

@@ -7,9 +7,11 @@
 - Retry read-only settings queries before writes without falling back to stale settings.
 - Verify a missing write acknowledgement by readback instead of sending duplicate writes.
 - Allow delayed write acknowledgements and temporarily stale readback reports to settle.
+- Skip redundant writes when a fresh device read already confirms the requested values.
+- Continue bounded readback verification across brief cloud reconnects without replaying writes.
 - Report whether a failure happened before or after settings were sent.
 - Clean up reply futures during send failures and unload, and surface negative correlated acknowledgements.
-- Add isolated client regression tests for timers, retries, write confirmation, and cleanup.
+- Add 24 isolated client regression tests for timers, retries, write confirmation, and cleanup on Python 3.13 and 3.14.
 
 ## 1.2.0
 
